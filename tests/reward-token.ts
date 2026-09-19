@@ -70,6 +70,92 @@ describe("fundraiser — reward token (bankrun)", () => {
       ],
       [mintKeypair]
     );
+      // ---------- 5 · abuse: someone else's reward mint --------------------------
+
+  it("abuse: a contribution naming the wrong reward mint is refused", async () => {
+    const c = await openCampaign();
+
+    // A perfectly valid mint that is NOT this campaign's reward mint.
+    const fake = anchor.web3.Keypair.generate();
+    const rent = await context.banksClient.getRent();
+    await send(
+      [
+        anchor.web3.SystemProgram.createAccount({
+          fromPubkey: payer.publicKey,
+          newAccountPubkey: fake.publicKey,
+          space: MINT_SIZE,
+          lamports: Number(rent.minimumBalance(BigInt(MINT_SIZE))),
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        createInitializeMint2Instruction(fake.publicKey, 9, payer.publicKey, null),
+      ],
+      [fake]
+    );
+    const fakeRewardAta = getAssociatedTokenAddressSync(fake.publicKey, payer.publicKey);
+
+    const ix = await program.methods
+      .contribute(new anchor.BN(ONE_TOKEN))
+      .accountsPartial({
+        contributor: payer.publicKey,
+        mintToRaise: mint,
+        fundraiser: c.fundraiser,
+        contributorAccount: c.contributorAccount,
+        contributorAta,
+        vault: c.vault,
+        rewardMint: fake.publicKey, // <- not the campaign's reward mint
+        contributorRewardAta: fakeRewardAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+
+    try {
+      await send([ix]);
+      assert.fail("a foreign reward mint must be refused");
+    } catch (err) {
+      assertErrorIs(err, "InvalidRewardMint", "the fundraiser only accepts its own reward mint");
+    }
+    assert.strictEqual(await balanceOf(c.vault), 0n, "no money moved");
+    assert.strictEqual(await supplyOf(c.rewardMint), 0n, "nothing was minted");
+  });
+
+  // ---------- 6 · boundary: the wallet cap -----------------------------------
+
+  it("boundary: exactly the wallet cap earns rewards, one token over earns none", async () => {
+    const c = await openCampaign(); // target 30 tokens => cap is 3 tokens per wallet
+
+    await send([await c.contributeIx(3 * ONE_TOKEN)]); // exactly at the cap: allowed
+    assert.strictEqual(await balanceOf(c.contributorRewardAta), 300_000_000_000n);
+
+    try {
+      await send([await c.contributeIx(ONE_TOKEN)]); // one token over the cap
+      assert.fail("a contribution over the wallet cap must be refused");
+    } catch (err) {
+      assertErrorIs(err, "MaximumContributionsReached", "over the per-wallet cap");
+    }
+    assert.strictEqual(await balanceOf(c.contributorRewardAta), 300_000_000_000n, "a refused contribution mints nothing");
+    const contributor = await program.account.contributor.fetch(c.contributorAccount);
+    assert.strictEqual(contributor.rewardsMinted.toString(), "300000000000", "state did not move either");
+  });
+
+  // ---------- 7 · abuse: contributing after the window closed ----------------
+
+  it("abuse: no rewards can be earned after the window closes", async () => {
+    const c = await openCampaign();
+    await send([await c.contributeIx(ONE_TOKEN)]);
+
+    await advanceDays(8n);
+
+    try {
+      await send([await c.contributeIx(ONE_TOKEN)]);
+      assert.fail("a contribution after the deadline must be refused");
+    } catch (err) {
+      assertErrorIs(err, "FundraiserEnded", "the window is closed");
+    }
+    assert.strictEqual(await balanceOf(c.contributorRewardAta), 100_000_000_000n, "still only the first reward");
+    assert.strictEqual(await supplyOf(c.rewardMint), 100_000_000_000n);
+  });
   });
 
   // ---------- helpers ------------------------------------------------------
